@@ -1,0 +1,16 @@
+{
+  "name": "blinkit-automation",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node blinkit_bot.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.63.0"
+  }
+}
