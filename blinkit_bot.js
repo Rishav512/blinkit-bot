@@ -460,11 +460,12 @@ async function run() {
   console.log(`Payment method: Cash on Delivery (COD)`);
   console.log(`Polling: Every 5 minutes + Sharp 12:00 AM Restock Surge\n`);
 
-  console.log('Launching Chromium with persistent session profile...');
+  const isRender = !!process.env.RENDER;
+  console.log(`Launching Chromium with persistent session profile... (Headless: ${isRender})`);
   let context = null;
   try {
     context = await chromium.launchPersistentContext(CONFIG.USER_DATA_DIR, {
-      headless: true,
+      headless: isRender,
       viewport: null,
       ignoreDefaultArgs: ['--enable-automation'],
       args: [
