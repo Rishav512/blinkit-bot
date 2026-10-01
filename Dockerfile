@@ -1,5 +1,8 @@
 FROM node:20-bookworm
 
+# Set Indian Standard Timezone (IST)
+ENV TZ=Asia/Kolkata
+
 # Set working directory
 WORKDIR /app
 

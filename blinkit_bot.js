@@ -4,15 +4,6 @@ const path = require('path');
 const readline = require('readline');
 const http = require('http');
 
-// Dummy server to bind to a port for Render.com free tier Web Service
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Blinkit Bot is running...\n');
-}).listen(PORT, () => {
-  console.log(`Dummy web server listening on port ${PORT}`);
-});
-
 // ==================== CONFIGURATION ====================
 const CONFIG = {
   TARGET_PRODUCT_URLS: [
@@ -23,15 +14,83 @@ const CONFIG = {
   TARGET_ADDRESS_LABEL: 'Home',
   CHIPS_SEARCH_QUERY: 'lays chips 20',
   CHIPS_TARGET_PRICE: 20,
-  POLL_INTERVAL_MS: 5 * 60 * 1000, // 5 minutes
+  POLL_INTERVAL_MS: (parseInt(process.env.POLL_INTERVAL_MINS || '5', 10)) * 60 * 1000, // Default: 5 minutes
   MIDNIGHT_BURST_WINDOW_MINS: 5,   // Rapid checks for 5 mins during 12:00 AM restock
   MIDNIGHT_BURST_INTERVAL_MS: 15000, // 15 seconds during midnight window
+  STORE_CLOSED_START_HOUR: parseInt(process.env.STORE_CLOSED_START_HOUR || '1', 10), // 1:00 AM IST
+  STORE_CLOSED_END_HOUR: parseInt(process.env.STORE_CLOSED_END_HOUR || '5', 10),     // 5:00 AM IST
+  BLOCK_MEDIA_ASSETS: process.env.BLOCK_MEDIA_ASSETS !== 'false', // Aborts images/fonts to keep Render bandwidth <100GB
   MAX_RETRIES: 2000,
   AUTO_ORDER: true, // User requested: order on COD
   USER_DATA_DIR: path.join(__dirname, 'userData'),
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
 };
+
+// ==================== IST TIMEZONE UTILITIES ====================
+// Indian Standard Time is strictly UTC+05:30 with no Daylight Saving Time
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const MS_IN_DAY = 24 * 60 * 60 * 1000;
+
+function getISTInfo(date = new Date()) {
+  const nowMs = date.getTime();
+  const msSinceIstMidnight = (nowMs + IST_OFFSET_MS) % MS_IN_DAY;
+  const hours = Math.floor(msSinceIstMidnight / (60 * 60 * 1000));
+  const minutes = Math.floor((msSinceIstMidnight % (60 * 60 * 1000)) / (60 * 1000));
+  const seconds = Math.floor((msSinceIstMidnight % (60 * 1000)) / 1000);
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const timeString = `${pad(hours)}:${pad(minutes)}:${pad(seconds)} IST`;
+  const dateFormatted = new Date(nowMs).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const dateTimeString = `${dateFormatted} ${timeString}`;
+
+  return {
+    nowMs,
+    msSinceIstMidnight,
+    hours,
+    minutes,
+    seconds,
+    timeString,
+    dateTimeString,
+  };
+}
+
+// ---------------- BOT LIVE STATE & HTTP SERVER ----------------
+const botState = {
+  status: 'initializing',
+  isStoreClosed: false,
+  attempt: 0,
+  lastCheckTime: null,
+  nextScheduledCheckTime: null,
+  lastReason: null,
+  restockedProduct: null,
+};
+
+// HTTP Server for Render free tier Web Service (also provides live health status)
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  const ist = getISTInfo();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    service: 'Blinkit Restock & COD Auto-Order Bot',
+    botStatus: botState.status,
+    storeStatus: botState.isStoreClosed ? `CLOSED (${CONFIG.STORE_CLOSED_START_HOUR}:00 AM - ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST)` : 'OPEN',
+    currentISTTime: ist.dateTimeString,
+    nextCheckScheduled: botState.nextScheduledCheckTime || 'Pending',
+    currentCycle: botState.attempt,
+    lastCheckTime: botState.lastCheckTime || 'N/A',
+    scheduleReason: botState.lastReason || 'N/A',
+    uptime: `${Math.floor(process.uptime() / 60)} minutes`,
+    renderOptimization: {
+      sleepWindow: `${CONFIG.STORE_CLOSED_START_HOUR}:00 AM - ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST`,
+      browserStatus: botState.isStoreClosed ? 'Closed (RAM & CPU released)' : 'Active',
+      assetBlocking: CONFIG.BLOCK_MEDIA_ASSETS ? 'Enabled (saves Render bandwidth)' : 'Disabled',
+      pingerTip: 'To maximize Render 750 free hours, configure your external pinger (e.g., cron-job.org) to pause pings between 01:00 and 05:00 IST so Render spins down during store closure.',
+    },
+  }, null, 2) + '\n');
+}).listen(PORT, () => {
+  console.log(`Web server listening on port ${PORT}`);
+});
 
 // ---------------- TELEGRAM NOTIFICATIONS ----------------
 async function sendTelegramNotification(message) {
@@ -83,6 +142,49 @@ function askQuestion(query) {
 
 async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------- BROWSER LAUNCH & PAGE SETUP ----------------
+async function launchBrowserContext() {
+  const isRender = !!process.env.RENDER;
+  console.log(`Launching Chromium persistent context... (Headless: ${isRender})`);
+  try {
+    const context = await chromium.launchPersistentContext(CONFIG.USER_DATA_DIR, {
+      headless: isRender,
+      viewport: null,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: [
+        '--start-maximized',
+        '--disable-blink-features=AutomationControlled',
+        '--no-default-browser-check',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
+    });
+    return context;
+  } catch (err) {
+    if (err.message.includes('Process singleton lock') || err.message.includes('Target page, context or browser has been closed')) {
+      console.error('\n[!] Chrome profile is locked because an existing Chrome window is already open.');
+      console.error('    Please close any other Chrome windows that were opened by this bot and rerun.\n');
+    }
+    throw err;
+  }
+}
+
+async function setupPage(page) {
+  if (CONFIG.BLOCK_MEDIA_ASSETS) {
+    // Intercept and abort heavy images, video media, and web fonts during routine stock polling
+    // This reduces data consumption by ~85-90%, preventing exhaustion of Render's 100GB monthly bandwidth limit
+    await page.route('**/*', (route) => {
+      const resourceType = route.request().resourceType();
+      if (['image', 'media', 'font'].includes(resourceType)) {
+        return route.abort();
+      }
+      return route.continue();
+    });
+  }
 }
 
 // ---------------- ADDRESS VERIFICATION ----------------
@@ -416,35 +518,61 @@ async function proceedToCheckoutAndPlaceOrderCOD(page) {
   return false;
 }
 
-function calculateNextCheckSchedule() {
-  const now = new Date();
+// ---------------- SCHEDULE & STORE HOURS CALCULATION ----------------
+function calculateNextCheckSchedule(date = new Date()) {
+  const ist = getISTInfo(date);
+  const msSinceMidnight = ist.msSinceIstMidnight;
 
-  // Calculate next midnight (12:00:00 AM)
-  const nextMidnight = new Date(now);
-  nextMidnight.setHours(24, 0, 0, 0); // Next 00:00:00
-  const msUntilMidnight = nextMidnight.getTime() - now.getTime();
+  const closedStartMs = CONFIG.STORE_CLOSED_START_HOUR * 60 * 60 * 1000; // e.g. 1:00 AM IST
+  const closedEndMs = CONFIG.STORE_CLOSED_END_HOUR * 60 * 60 * 1000;     // e.g. 5:00 AM IST
+  const burstEndMs = CONFIG.MIDNIGHT_BURST_WINDOW_MINS * 60 * 1000;      // e.g. 12:05 AM IST
 
-  // Check if we are currently within the midnight restock window (00:00:00 to 00:05:00)
-  const isMidnightWindow = (now.getHours() === 0 && now.getMinutes() < CONFIG.MIDNIGHT_BURST_WINDOW_MINS);
-
-  if (isMidnightWindow) {
+  // 1. Inside Store Closed Window (1:00 AM to 5:00 AM IST)
+  if (msSinceMidnight >= closedStartMs && msSinceMidnight < closedEndMs) {
+    const waitMs = closedEndMs - msSinceMidnight;
     return {
+      type: 'STORE_CLOSED',
+      waitMs,
+      reason: `🌙 Store is CLOSED (${CONFIG.STORE_CLOSED_START_HOUR}:00 AM - ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST). Paused until 5:00 AM IST.`,
+    };
+  }
+
+  // 2. Midnight Restock Burst Window (12:00:00 AM to 12:05:00 AM IST)
+  if (msSinceMidnight < burstEndMs) {
+    return {
+      type: 'MIDNIGHT_BURST',
       waitMs: CONFIG.MIDNIGHT_BURST_INTERVAL_MS,
       reason: '⚡ 12:00 AM MIDNIGHT RESTOCK WINDOW (Rapid 15s polling)',
     };
   }
 
-  // If next midnight arrives sooner than 15 minutes, pause until exactly 12:00:00 AM!
+  // 3. Approaching 1:00 AM store closure (e.g. between 00:05 and 01:00)
+  if (msSinceMidnight < closedStartMs) {
+    const msUntilClose = closedStartMs - msSinceMidnight;
+    if (msUntilClose > 0 && msUntilClose < CONFIG.POLL_INTERVAL_MS) {
+      return {
+        type: 'SYNC_CLOSE',
+        waitMs: msUntilClose,
+        reason: `⏳ Approaching ${CONFIG.STORE_CLOSED_START_HOUR}:00 AM store closure`,
+      };
+    }
+  }
+
+  // 4. Approaching 12:00:00 AM Midnight (e.g., within POLL_INTERVAL_MS before midnight)
+  const msUntilMidnight = MS_IN_DAY - msSinceMidnight;
   if (msUntilMidnight > 0 && msUntilMidnight < CONFIG.POLL_INTERVAL_MS) {
     return {
+      type: 'SYNC_MIDNIGHT',
       waitMs: msUntilMidnight,
       reason: '🎯 Scheduled for EXACTLY 12:00:00 AM Midnight Restock',
     };
   }
 
+  // 5. Standard Polling Interval
   return {
+    type: 'STANDARD',
     waitMs: CONFIG.POLL_INTERVAL_MS,
-    reason: 'Standard 5-minute interval',
+    reason: `Standard interval (${CONFIG.POLL_INTERVAL_MS / 60000} mins)`,
   };
 }
 
@@ -458,34 +586,31 @@ async function run() {
   console.log(`Address: "${CONFIG.TARGET_ADDRESS_LABEL}"`);
   console.log(`Extra item: 20 Rupee Chips`);
   console.log(`Payment method: Cash on Delivery (COD)`);
-  console.log(`Polling: Every 5 minutes + Sharp 12:00 AM Restock Surge\n`);
+  console.log(`Polling: Every ${CONFIG.POLL_INTERVAL_MS / 60000} mins + Sharp 12:00 AM Restock Surge`);
+  console.log(`Store Closed Window: ${CONFIG.STORE_CLOSED_START_HOUR}:00 AM to ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST (Process pauses & browser closes)`);
+  console.log(`Render Bandwidth Optimization: ${CONFIG.BLOCK_MEDIA_ASSETS ? 'Enabled (Images/Fonts blocked to stay under 100GB)' : 'Disabled'}\n`);
 
-  const isRender = !!process.env.RENDER;
-  console.log(`Launching Chromium with persistent session profile... (Headless: ${isRender})`);
-  let context = null;
-  try {
-    context = await chromium.launchPersistentContext(CONFIG.USER_DATA_DIR, {
-      headless: isRender,
-      viewport: null,
-      ignoreDefaultArgs: ['--enable-automation'],
-      args: [
-        '--start-maximized',
-        '--disable-blink-features=AutomationControlled',
-        '--no-default-browser-check',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
-      ],
-    });
-  } catch (err) {
-    if (err.message.includes('Process singleton lock') || err.message.includes('Target page, context or browser has been closed')) {
-      console.error('\n[!] Chrome profile is locked because an existing Chrome window is already open.');
-      console.error('    Please close any other Chrome windows that were opened by this bot and rerun.\n');
-    }
-    throw err;
+  botState.status = 'active';
+
+  // Check if store is already closed upon startup (1:00 AM to 5:00 AM IST)
+  let initialSchedule = calculateNextCheckSchedule();
+  if (initialSchedule.type === 'STORE_CLOSED') {
+    botState.isStoreClosed = true;
+    botState.lastReason = initialSchedule.reason;
+    const wakeIST = getISTInfo(new Date(Date.now() + initialSchedule.waitMs));
+    botState.nextScheduledCheckTime = `${wakeIST.timeString} (~${(initialSchedule.waitMs / 3600000).toFixed(2)} hrs)`;
+    console.log(`\n======================================================`);
+    console.log(`🌙 [STORE CLOSED] Currently inside closed hours (${CONFIG.STORE_CLOSED_START_HOUR}:00 AM - ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST).`);
+    console.log(`   Holding off browser launch until ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST to conserve Render hours, RAM & CPU.`);
+    console.log(`   Sleeping for ${(initialSchedule.waitMs / 3600000).toFixed(2)} hours until ${wakeIST.timeString}...`);
+    console.log(`======================================================\n`);
+    await sleep(initialSchedule.waitMs);
+    botState.isStoreClosed = false;
   }
 
-  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+  let context = await launchBrowserContext();
+  let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+  await setupPage(page);
 
   try {
     console.log('Opening Blinkit home page to verify session & address...');
@@ -499,8 +624,10 @@ async function run() {
     let attempt = 1;
 
     while (!restockedProductUrl && attempt <= CONFIG.MAX_RETRIES) {
-      const nowStr = new Date().toLocaleTimeString();
-      console.log(`\n--- Availability Check Cycle #${attempt} [${nowStr}] ---`);
+      botState.attempt = attempt;
+      const istNow = getISTInfo();
+      botState.lastCheckTime = istNow.timeString;
+      console.log(`\n--- Availability Check Cycle #${attempt} [${istNow.timeString}] ---`);
 
       for (let i = 0; i < CONFIG.TARGET_PRODUCT_URLS.length; i++) {
         const prodUrl = CONFIG.TARGET_PRODUCT_URLS[i];
@@ -508,6 +635,7 @@ async function run() {
         const isInStock = await checkProductStockAndAdd(page, prodUrl);
         if (isInStock) {
           restockedProductUrl = prodUrl;
+          botState.restockedProduct = prodUrl;
           break; // Found one in stock! Don't check the others, order this one asap.
         }
         if (i < CONFIG.TARGET_PRODUCT_URLS.length - 1) {
@@ -516,6 +644,13 @@ async function run() {
       }
 
       if (restockedProductUrl) {
+        // Unblock media assets for checkout so payment and cart render with full fidelity
+        if (CONFIG.BLOCK_MEDIA_ASSETS && page) {
+          try {
+            await page.unroute('**/*');
+          } catch (_) {}
+        }
+
         console.log(`\n>>> Product restocked and added to cart: ${restockedProductUrl}`);
         console.log('Proceeding with extra items and checkout ASAP...');
         
@@ -531,16 +666,19 @@ async function run() {
           orderSuccess = false;
         }
 
+        const orderIst = getISTInfo();
         if (orderSuccess) {
+          botState.status = 'ordered';
           console.log('\n[SUCCESS] Order placed automatically on COD!');
           await sendTelegramNotification(
             `🎉 *Blinkit Order Placed Successfully!*\n\n` +
             `• *Product*: [Blinkit Target Product](${restockedProductUrl})\n` +
             `• *Address*: ${CONFIG.TARGET_ADDRESS_LABEL}\n` +
             `• *Payment*: Cash on Delivery (COD)\n` +
-            `• *Time*: ${new Date().toLocaleString()}`
+            `• *Time*: ${orderIst.dateTimeString}`
           );
         } else {
+          botState.status = 'manual_intervention_required';
           console.warn('\n=============================================================');
           console.warn('⚠️ ATTENTION: Product is in stock but order could not be placed!');
           console.warn('   Dispatching Telegram notification for MANUAL INTERVENTION...');
@@ -552,7 +690,7 @@ async function run() {
             `⚠️ The target product is *IN STOCK* and added to your cart, but the bot could *NOT* place the order automatically (COD unavailable or checkout blocked).\n\n` +
             `📍 *Delivery Address*: ${CONFIG.TARGET_ADDRESS_LABEL}\n` +
             `🛒 *Product Link*: [View Product](${restockedProductUrl})\n` +
-            `⏰ *Time*: ${new Date().toLocaleString()}\n\n` +
+            `⏰ *Time*: ${orderIst.dateTimeString}\n\n` +
             `👉 *Please open the browser window on your PC immediately to complete the payment and order manually!*`
           );
         }
@@ -560,11 +698,46 @@ async function run() {
       }
 
       const schedule = calculateNextCheckSchedule();
-      const nextTime = new Date(Date.now() + schedule.waitMs).toLocaleTimeString();
+      botState.lastReason = schedule.reason;
+
+      // Handle 1:00 AM - 5:00 AM Store Closed Window
+      if (schedule.type === 'STORE_CLOSED') {
+        botState.isStoreClosed = true;
+        const wakeIst = getISTInfo(new Date(Date.now() + schedule.waitMs));
+        botState.nextScheduledCheckTime = `${wakeIst.timeString} (~${(schedule.waitMs / 3600000).toFixed(2)} hrs)`;
+
+        console.log(`\n======================================================`);
+        console.log(`🌙 [STORE CLOSED] Blinkit is closed between ${CONFIG.STORE_CLOSED_START_HOUR}:00 AM and ${CONFIG.STORE_CLOSED_END_HOUR}:00 AM IST.`);
+        console.log(`   Closing browser to release RAM & CPU and conserve Render resources.`);
+        console.log(`   Process paused for ${(schedule.waitMs / 3600000).toFixed(2)} hours until ${wakeIst.timeString}...`);
+        console.log(`======================================================\n`);
+
+        if (context) {
+          await context.close().catch(() => {});
+          context = null;
+          page = null;
+        }
+
+        await sleep(schedule.waitMs);
+
+        console.log(`\n🌅 [STORE OPENING] 5:00 AM IST reached! Re-launching fresh browser and resuming monitoring...`);
+        context = await launchBrowserContext();
+        page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+        await setupPage(page);
+        await page.goto('https://blinkit.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await sleep(3000);
+        await verifyAndSetAddress(page);
+        botState.isStoreClosed = false;
+        attempt++;
+        continue;
+      }
+
+      const nextIst = getISTInfo(new Date(Date.now() + schedule.waitMs));
+      botState.nextScheduledCheckTime = nextIst.timeString;
       const waitMinutes = (schedule.waitMs / 60000).toFixed(1);
 
       console.log(`[Schedule] ${schedule.reason}`);
-      console.log(`Next check scheduled at ${nextTime} (in ~${waitMinutes} min). Sleeping...`);
+      console.log(`Next check scheduled at ${nextIst.timeString} (in ~${waitMinutes} min). Sleeping...`);
 
       await sleep(schedule.waitMs);
       attempt++;
@@ -578,9 +751,10 @@ async function run() {
     console.error('An error occurred during bot execution:', error);
   } finally {
     if (context) {
-      await context.close();
+      await context.close().catch(() => {});
     }
   }
 }
 
 run();
+
