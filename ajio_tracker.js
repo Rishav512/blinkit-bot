@@ -213,55 +213,97 @@ async function evaluateProduct(page, item, history) {
       console.log(`❌ Out of Stock Sizes: ${oosSizes.join(', ')};`);
     }
 
-    // Determine alerts to dispatch
-    const alertTriggers = [];
-
-    // 1. Target Price reached
-    if (targetPriceNum && currentPriceNum && currentPriceNum <= targetPriceNum) {
-      if (!prevRecord.alertedTargetPrice || prevRecord.lastPrice > currentPriceNum) {
-        alertTriggers.push(`🎯 *Target Price Reached!* Price is now *${data.sellingPrice}* (Target: ₹${targetPriceNum})`);
-      }
-    }
-
-    // 2. Price drop compared to previous check
-    if (prevRecord.lastPrice && currentPriceNum && currentPriceNum < prevRecord.lastPrice) {
-      const drop = prevRecord.lastPrice - currentPriceNum;
-      alertTriggers.push(`📉 *Price Dropped by ₹${drop}!* Was ₹${prevRecord.lastPrice}, now *${data.sellingPrice}*`);
-    }
-
-    // 3. Target Size Restocked
-    if (targetSizes.length > 0) {
-      for (const targetSize of targetSizes) {
-        const sizeObj = data.sizes.find(s => s.size.toLowerCase() === targetSize);
-        if (sizeObj && sizeObj.inStock) {
-          const prevSizesObj = (prevRecord.sizes || []).find(s => s.size.toLowerCase() === targetSize);
-          const wasOOS = !prevSizesObj || !prevSizesObj.inStock;
-          if (wasOOS) {
-            alertTriggers.push(`✨ *Desired Size Restocked!* Size *${sizeObj.size}* is now IN STOCK!`);
-          }
+    // Determine best effective price (checking selling price and coupon offers like "Get it for ₹270")
+    let bestOfferPrice = null;
+    let bestOfferDetail = null;
+    for (const offer of data.offers) {
+      const match = offer.match(/get it for\s*₹?\s*([0-9,]+)/i);
+      if (match) {
+        const p = parsePriceNumber(match[1]);
+        if (p && (!bestOfferPrice || p < bestOfferPrice)) {
+          bestOfferPrice = p;
+          bestOfferDetail = offer;
         }
       }
     }
 
-    // 4. Full Restock (Was completely OOS previously, now back in stock)
-    if (prevRecord.isCompletelyOOS && !data.isCompletelyOOS && availableSizes.length > 0) {
-      alertTriggers.push(`🎉 *Product Restocked!* This item was previously sold out and is now back in stock.`);
+    const effectivePrice = (bestOfferPrice && currentPriceNum)
+      ? Math.min(currentPriceNum, bestOfferPrice)
+      : (currentPriceNum || bestOfferPrice);
+
+    // Check if price is lower than target threshold (e.g. < 300)
+    const isPriceBelowThreshold = (targetPriceNum && effectivePrice)
+      ? (effectivePrice <= targetPriceNum)
+      : false;
+
+    // Check if desired target size (e.g. "M") is available
+    const availableTargetSizes = targetSizes.filter(ts =>
+      data.sizes.some(s => s.size.toLowerCase() === ts && s.inStock)
+    );
+    const hasTargetSizeAvailable = targetSizes.length > 0 ? (availableTargetSizes.length > 0) : true;
+
+    // COMBINED SUCCESS CRITERIA:
+    // If both target price and target size are defined, success requires BOTH (Price < target AND size available)
+    const requiresBoth = Boolean(targetPriceNum && targetSizes.length > 0);
+    const isTargetMatchSuccess = requiresBoth
+      ? (isPriceBelowThreshold && hasTargetSizeAvailable)
+      : (isPriceBelowThreshold || hasTargetSizeAvailable);
+
+    // Determine alerts to dispatch
+    const alertTriggers = [];
+
+    if (isTargetMatchSuccess) {
+      console.log(`\n======================================================`);
+      console.log(`🎉🎉 SUCCESS! TARGET CRITERIA MET! 🎉🎉`);
+      console.log(`   • Price: ₹${effectivePrice} (Lower than ₹${targetPriceNum})`);
+      if (targetSizes.length > 0) {
+        console.log(`   • Desired Size (${availableTargetSizes.join(', ').toUpperCase()}) is IN STOCK!`);
+      }
+      console.log(`======================================================\n`);
+      process.stdout.write('\x07'); // Terminal alert bell
+
+      // Alert only once per price level to prevent spam
+      if (!prevRecord.matchedSuccess || prevRecord.lastSuccessPrice !== effectivePrice) {
+        alertTriggers.push(
+          `🎉 *SUCCESS! TARGET MATCH FOUND!* 🎉\n` +
+          `🚨 Price is *₹${effectivePrice}* (< ₹${targetPriceNum}) and Size *${availableTargetSizes.join(', ').toUpperCase()}* is *IN STOCK*!`
+        );
+      }
+    } else {
+      // Print detailed real-time tracking status in terminal
+      if (requiresBoth) {
+        const priceStatus = isPriceBelowThreshold
+          ? `✅ Price ₹${effectivePrice} is < ₹${targetPriceNum}`
+          : `⏳ Price ₹${effectivePrice || 'N/A'} is not yet < ₹${targetPriceNum}`;
+        const sizeStatus = hasTargetSizeAvailable
+          ? `✅ Size ${targetSizes.join(', ').toUpperCase()} is IN STOCK`
+          : `⏳ Size ${targetSizes.join(', ').toUpperCase()} is OUT OF STOCK`;
+        console.log(`\n[Tracking Status] Waiting for both conditions:\n   ${priceStatus}\n   ${sizeStatus}`);
+      }
+
+      // Secondary alert: Notify if price dropped compared to previous check cycle
+      if (prevRecord.lastPrice && effectivePrice && effectivePrice < prevRecord.lastPrice) {
+        const drop = prevRecord.lastPrice - effectivePrice;
+        alertTriggers.push(`📉 *Price Dropped by ₹${drop}!* Was ₹${prevRecord.lastPrice}, now *₹${effectivePrice}*`);
+      }
     }
 
     // Send Telegram Notification if any alert was triggered
     if (alertTriggers.length > 0) {
-      console.log(`\n🔔 Triggering Telegram Alert for "${data.title}"...`);
+      console.log(`\n🔔 Dispatching Telegram Alert for "${data.title}"...`);
       const message = [
-        `🛒 *AJIO PRICE & AVAILABILITY ALERT!*`,
+        isTargetMatchSuccess ? `🎯 *AJIO TARGET SUCCESS ALERT!*` : `🛒 *AJIO PRICE & AVAILABILITY UPDATE*`,
+        ``,
         ...alertTriggers,
         ``,
         `• *Product*: ${data.brand ? `*${data.brand}* - ` : ''}${data.title}`,
-        `• *Current Price*: *${data.sellingPrice || 'N/A'}* ${data.discount ? `(${data.discount})` : ''}`,
+        `• *Price*: *₹${effectivePrice || 'N/A'}* ${data.discount ? `(${data.discount})` : ''}`,
+        bestOfferDetail ? `• *Best Offer*: ${bestOfferDetail}` : null,
         data.mrp ? `• *Original MRP*: ${data.mrp}` : null,
-        availableSizes.length > 0 ? `• *In-Stock Sizes*: ${availableSizes.join(', ')}` : `• *In-Stock Sizes*: Out of Stock`,
-        data.offers.length > 0 ? `• *Coupon Offer*: ${data.offers[0]}` : null,
+        availableSizes.length > 0 ? `• *Available Sizes*: ${availableSizes.join(', ')}` : `• *Available Sizes*: None (Out of Stock)`,
         ``,
-        `🔗 [Open Product on Ajio](${url})`,
+        `👉 *Open immediately on Ajio:*`,
+        `🔗 [BUY NOW ON AJIO](${url})`,
         `⏰ *Time*: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`
       ].filter(line => line !== null).join('\n');
 
@@ -272,17 +314,19 @@ async function evaluateProduct(page, item, history) {
     history[historyKey] = {
       name: item.name || data.title,
       lastCheckTime: new Date().toISOString(),
-      lastPrice: currentPriceNum,
+      lastPrice: effectivePrice,
       sellingPriceFormatted: data.sellingPrice,
       mrp: data.mrp,
       isCompletelyOOS: data.isCompletelyOOS,
       sizes: data.sizes,
-      alertedTargetPrice: (targetPriceNum && currentPriceNum && currentPriceNum <= targetPriceNum),
+      matchedSuccess: isTargetMatchSuccess,
+      lastSuccessPrice: isTargetMatchSuccess ? effectivePrice : null,
     };
 
   } catch (err) {
     console.error(`[!] Error inspecting product "${item.name || url}":`, err.message);
   }
+
 }
 
 async function createBrowserSession() {
