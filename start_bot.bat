@@ -1,5 +1,6 @@
 @echo off
-title Blinkit Restock Bot
+title Ajio Product Tracker
 cd /d "%~dp0"
 npm start
 pause
+

@@ -1,3 +1,6 @@
 node_modules/
-userData/
+ajioUserData/
+ajioUserData_worker_*/
+ajio_history.json
 .env
+

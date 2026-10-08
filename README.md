@@ -1,103 +1,77 @@
-# Blinkit Restock, Chips & COD Auto-Order Bot
+# AJIO Price & Size Availability Tracker
 
-Automated bot configured to monitor:
-- **Target Products** (Orders whichever comes into stock first):
-  1. `https://blinkit.com/prn/x/prid/804925`
-  2. `https://blinkit.com/prn/x/prid/1383211`
-  3. `https://blinkit.com/prn/x/prid/1382030`
-- **Delivery Address**: **Home**
-- **Extra Item**: ₹20 Chips (e.g., Lay's ₹20)
-- **Payment Method**: **Cash on Delivery (COD)**
-- **Polling Interval**: Every 5 minutes + **Sharp 12:00 AM Midnight Restock Surge**
-- **Store Closed Window**: **1:00 AM – 5:00 AM IST** (process paused, browser closed to save Render hours & RAM)
+Automated tracker that monitors product prices, discounts, coupon offers, and individual size availability on **AJIO** with instant **Telegram alerts**.
 
 ---
 
-## Restock & Polling Schedule (Indian Standard Time - IST)
+## Features
 
-1. **Standard Checks**: Runs every **5 minutes** (configurable via `POLL_INTERVAL_MINS`) between 5:00 AM and 1:00 AM IST.
-2. **12:00 AM Midnight Surge**:
-   - The bot calculates remaining time to 12:00:00 AM IST. If the polling interval would overshoot midnight, it synchronizes to wake up **precisely at 12:00:00 AM IST**.
-   - During the restock window (**12:00 AM – 12:05 AM IST**), it switches to high-frequency polling (every 15 seconds) so you don't miss the restock drop.
-3. **1:00 AM – 5:00 AM Store Closure (Render Resource Saver)**:
-   - Blinkit dark stores are closed between **1:00 AM and 5:00 AM IST**.
-   - At 1:00 AM IST, the bot closes the Chromium browser context (freeing memory and CPU to 0%) and pauses checking.
-   - At 5:00 AM IST, the bot automatically re-opens a fresh browser session and resumes polling.
+* **Akamai Anti-Bot Bypass**: Uses persistent Chromium browser profiles and masked automation arguments to load AJIO product detail pages reliably.
+* **Size-by-Size Availability Tracking**: Inspects individual size buttons (`size-instock` vs `swatch-size-oos`), allowing you to track specific sizes (e.g., `M`, `L`, `UK 8`, `UK 11`).
+* **Target Price Alerts**: Triggers an alert when the selling price drops to or below your target threshold.
+* **Price Drop Detection**: Notifies you whenever an item's price drops compared to the previous check cycle.
+* **Coupon & Bank Offer Extraction**: Automatically extracts active coupon codes (e.g., `NEW30`, `ALLSTARS10`) and promotional discounted prices.
+* **Smart Notification Cache**: Stores history in `ajio_history.json` to prevent duplicate spamming when price or availability has not changed.
+* **Cloud Ready**: Includes an optional HTTP status server on port 3000 for Docker / Render deployments.
 
 ---
 
-## Render Free Tier Optimization (Monthly Limits Guide)
+## Quick Setup
 
-Render Free Web Services offer **750 free instance hours** and **100 GB egress bandwidth** per month. Here is how the bot ensures you never exhaust these limits:
+### 1. Telegram Notifications
+1. Message `@BotFather` on Telegram to create a bot and get your **Bot Token**.
+2. Message `@userinfobot` on Telegram to get your **Chat ID**.
+3. Create or update your `.env` file:
+   ```env
+   TELEGRAM_BOT_TOKEN=your_bot_token_here
+   TELEGRAM_CHAT_ID=your_chat_id_here
+   AJIO_POLL_INTERVAL_MINS=15
+   HEADLESS=false
+   ```
 
-### 1. Saving Free Instance Hours (750 Hours / Month)
-- Running 24/7 in a 31-day month consumes **744 hours** (leaving < 6 hours margin).
-- Render free web services automatically spin down after 15 minutes of receiving no HTTP requests.
-- **How to save ~116 hours/month**:
-  If you use a free pinging service (like [cron-job.org](https://cron-job.org) or UptimeRobot) to keep Render awake, **schedule it to pause pings between 1:00 AM and 5:00 AM IST**:
-  - **In cron-job.org**: Set interval to every 10 or 14 minutes, and set active schedule to **05:00 to 00:59 IST** (or cron expression: `*/10 5-23,0 * * *` with timezone `Asia/Kolkata` / `*/10 23-24,0-18 * * *` in UTC).
-  - When pings stop at 1:00 AM IST, Render automatically spins down the container at ~1:15 AM IST and wakes up when pings resume at 5:00 AM IST.
-  - This saves **3.75 hours every day (~116 hours/month)**, dropping monthly usage to ~628 hours!
-
-### 2. Saving Egress Bandwidth (< 100 GB / Month)
-- Enabled by default (`BLOCK_MEDIA_ASSETS=true`): The bot automatically blocks heavy images, fonts, and video ads during routine background checks.
-- This slashes data usage by ~85-90% (from ~140 GB/month down to < 5 GB/month) and significantly speeds up page checks.
-- Images and styles are automatically unblocked if an item comes in stock so checkout and payment render normally.
-
-### 3. Live Health & Schedule Status Endpoint
-Visiting the root URL of your deployed Render service (or `http://localhost:3000`) returns live JSON status:
+### 2. Configure Products to Track
+Edit [ajio_products.json](file:///c:/Users/rishav.nanda/OneDrive%20-%20Incture/Desktop/blinkitBot/ajio_products.json):
 ```json
-{
-  "service": "Blinkit Restock & COD Auto-Order Bot",
-  "botStatus": "active",
-  "storeStatus": "OPEN",
-  "currentISTTime": "01/10/2026 15:45:00 IST",
-  "nextCheckScheduled": "15:50:00 IST",
-  "currentCycle": 12,
-  "renderOptimization": {
-    "sleepWindow": "1:00 AM - 5:00 AM IST",
-    "browserStatus": "Active",
-    "assetBlocking": "Enabled"
+[
+  {
+    "name": "TEAMSPIRIT Men Side Stripe Regular Fit Track Pants",
+    "url": "https://www.ajio.com/teamspirit-men-side-stripe-regular-fit-track-pants/p/443101286_cream?user=old",
+    "targetPrice": 270,
+    "targetSizes": ["M", "L"]
   }
-}
+]
 ```
 
----
-
-## Action on Restock
-
-1. **Add Target Product**: Clicks **ADD** on `https://blinkit.com/prn/x/prid/804925`.
-2. **Add Extra Item**: Searches and adds a **₹20 pack of chips** to the cart.
-3. **Checkout on COD**:
-   - Opens cart and verifies "Home" delivery.
-   - Selects **Cash on Delivery (COD)**.
-   - Automatically clicks **Place Order**.
-
----
-
-## Telegram Notifications (Manual Intervention & Order Alerts)
-
-The bot will send you a Telegram message if:
-- 🚨 **Manual Intervention Required**: The target item is **in stock** and added to cart, but auto-checkout/COD cannot be completed.
-- 🎉 **Order Placed**: Cash on Delivery order was completed automatically.
-
-### Setup Telegram Bot Credentials:
-1. Open Telegram and search for `@BotFather`.
-2. Send `/newbot` and follow the prompts to create your bot. Copy the **HTTP API token**.
-3. To get your **Chat ID**, open Telegram and message `@userinfobot` (it will reply with your `Id`).
-4. Paste both in your `.env` file:
-   ```env
-   TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
-   TELEGRAM_CHAT_ID=987654321
-   ```
+* **`name`**: Custom label for the item (shown in logs and Telegram alerts).
+* **`url`**: The direct product URL from Ajio.
+* **`targetPrice`**: *(Optional)* Price in ₹. Triggers an alert when `currentPrice <= targetPrice`.
+* **`targetSizes`**: *(Optional)* Array of sizes to track (e.g., `["M", "L"]` or `["8", "9"]`). Triggers an alert the moment any of these sizes restock.
 
 ---
 
 ## How to Run
 
-1. Make sure previous Chrome windows opened by this bot are closed.
-2. In your terminal:
-   ```powershell
-   npm start
-   ```
+### Continuous Monitoring (Automatic polling with Telegram alerts)
+```powershell
+npm start
+```
+*(or `npm run track`)*
 
+### Quick One-Time Check (Inspects all products once and exits)
+```powershell
+npm run track:once
+```
+
+### Windows Batch File
+Double-click `start_bot.bat` to launch the tracker in a separate terminal window.
+
+---
+
+## Configuration Options
+
+| Environment Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TELEGRAM_BOT_TOKEN` | `""` | Telegram Bot API token |
+| `TELEGRAM_CHAT_ID` | `""` | Telegram user/group Chat ID |
+| `AJIO_POLL_INTERVAL_MINS` | `15` | Polling interval in minutes |
+| `HEADLESS` | `false` | Set to `true` to run browser completely hidden in background |
